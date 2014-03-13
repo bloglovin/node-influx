@@ -3,14 +3,16 @@ var request = require('request');
 var url     = require('url');
 var _       = require('underscore');
 
-var InfluxDB = function(host, port, username, password, database) {
+var InfluxDB = function(host, port, username, password, database, logFunction) {
 
   this.options = {
-    host:     host     || 'localhost',
-    port:     port     || 8086,
-    username: username || 'root',
-    password: password || 'root',
-    database: database
+    host                : host     || 'localhost',
+    port                : port     || 8086,
+    username            : username || 'root',
+    password            : password || 'root',
+    database            : database,
+    depreciatedLogging  : ((process.env.NODE_ENV === undefined || 'development') || logFunction)
+                          ? logFunction || console.log : false
   };
 
   return this;
@@ -50,7 +52,7 @@ InfluxDB.prototype.createDatabase = function(databaseName, callback) {
     },
     body: JSON.stringify({
       name: databaseName
-    }, null),
+    }, null)
   }, this._parseCallback(callback));
 };
 
@@ -75,6 +77,12 @@ InfluxDB.prototype.getDatabaseNames = function(callback) {
 
 
 InfluxDB.prototype.getSeriesNames = function(databaseName,callback) {
+    // if database defined on connection level use it unless overwritten
+    if ( this.options.database && typeof databaseName == "function" ) {
+      callback = databaseName;
+      databaseName = this.options.database;
+    }
+
     request({
         url: this.url('db/' + databaseName + '/series', {q: 'list series'}),
         json: true
@@ -101,29 +109,44 @@ InfluxDB.prototype.createUser = function(databaseName, username, password, callb
   }, this._parseCallback(callback));
 };
 
-InfluxDB.prototype.writePoint = function(seriesName, values, options, callback) {
+
+InfluxDB.prototype.writeSeries = function(series, options, callback) {
   if(typeof options === 'function') {
     callback = options;
     options  = {};
   }
-  var datum = { points: [], name: seriesName, columns: [] };
-  point     = [];
 
   var query = options.query || {};
+  var data = [];
 
-  _.each(values, function(v, k) {
-    if(k === 'time' && v instanceof Date) {
-      v = v.valueOf();
-      query.time_precision = 'm';
-    }
-    point.push(v);
-    datum.columns.push(k);
+  _.each(series, function(dataPoints, seriesName) {
+    var datum = { points: [], name: seriesName, columns: [] };
+    // Collect column names first
+    var columns = {};
+    _.each(dataPoints, function(values) {
+      _.each(values, function(_, k) {
+        columns[k] = true;
+      });
+    });
+    datum.columns = _.keys(columns);
+    // Add point values with null where needed
+    _.each(dataPoints, function(values) {
+      var point = [];
+      _.each(datum.columns, function(k) {
+        var v = typeof values[k] === 'undefined' ? null : values[k];
+        if(k === 'time' && v instanceof Date) {
+          v = v.valueOf();
+          query.time_precision = 'm';
+        }
+        point.push(v);
+      });
+      datum.points.push(point);
+    });
+    data.push(datum);
   });
 
-  datum.points.push(point);
-  data = [datum];
   request.post({
-    uri: this.seriesUrl(this.options.database, query),
+    uri: this.seriesUrl(this.options.database),
     headers: {
       'content-type': 'application/json'
     },
@@ -132,14 +155,33 @@ InfluxDB.prototype.writePoint = function(seriesName, values, options, callback) 
   }, this._parseCallback(callback));
 };
 
-InfluxDB.prototype.readPoints = function(query, callback) {
+InfluxDB.prototype.writePoint = function(seriesName, values, options, callback) {
+  var data = {};
+  data[seriesName] = [values];
+  this.writeSeries(data, options, callback);
+};
+
+InfluxDB.prototype.writePoints = function(seriesName, points, options, callback) {
+  var data = {};
+  data[seriesName] = points;
+  this.writeSeries(data, options, callback);
+};
+
+InfluxDB.prototype.query = function(query, callback) {
   request({
     url: this.url('db/' + this.options.database + '/series', { q: query }),
     json: true
   }, this._parseCallback(callback));
 };
 
-InfluxDB.prototype.seriesUrl  = function(databaseName, query) {
+// legacy function
+InfluxDB.prototype.readPoints = function(query, callback) {
+    if (this.options.depreciatedLogging) this.options.depreciatedLogging('influx.readPoints() has been depreciated, please use influx.query()');
+    this.query(query,callback);
+};
+
+InfluxDB.prototype.seriesUrl  = function(databaseName) {
+  if ( !databaseName ) databaseName = this.options.database;
   return this.url('db/' + databaseName + '/series');
 };
 
